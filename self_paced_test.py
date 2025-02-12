@@ -5,9 +5,6 @@
 @Date  : 2023/4/6 10:24
 @Software  : pycharm
 """
-import sys
-sys.path.append('./etnet/')
-sys.path.append('./mode2v/')
 import argparse
 import itertools
 import os
@@ -17,7 +14,6 @@ from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
-from torch.nn import L1Loss
 import cv2
 import kornia.geometry.transform as K
 import matplotlib.pyplot as plt
@@ -32,14 +28,11 @@ from torch.utils.data import DataLoader
 from cedric_firenet.options.inference_options import set_inference_options
 from e2v_utils import LossFn
 from spade_e2v import Unet6 as Unet
-from etnet.model.eitr.eitr import EITR
 import time
-from ETloss import perceptual_loss, temporal_consistency_loss
-
-from modelpami import recon_model as model_arch
+from cedric_firenet.utils.loading_utils import load_model
+from org_e2vid.model import E2VIDRecurrent
+from ETloss import perceptual_loss
 from modeltcsvt.networks import SSIR
-from mode2v.e2v_model import CistaLSTCNet, CistaTCNet
-torch.autograd.set_detect_anomaly(True)
 
 class DataSet(data.Dataset):
     def __init__(self, path, train, seq_len, args, abs_e=True, crop_x=256, crop_y=256, img_ch=1, num_samples=7,
@@ -187,7 +180,7 @@ class DataSet(data.Dataset):
         for sample_id, sample_num in enumerate(nums):
             # Take first n events from events
             sample = evs_stream[-nums[sample_id]:]
-            for idx, evs in enumerate(np.split(sample, self.seq_len)):
+            for idx, evs in enumerate(np.split(sample, 15)):
                 # Call ev2grid to aggregate events into voxels
                 voxel_grid = self.ev2grid(evs, num_bins=self.num_bins, width=self.w, height=self.h)
 
@@ -202,7 +195,6 @@ class DataSet(data.Dataset):
                     sampled_events[idx, :] = event_transform
 
             output_events[sample_id, :] = sampled_events
-            # output_events1 = output_events[:,0,:]
 
         return output_events
 
@@ -464,58 +456,30 @@ def visualize_feature_map(train_pred, save_path=None):
 def dataset(args):
     trainpath = osp.join(args.root_dir)
     tr = DataSet(trainpath, train=True, seq_len=args.seq_len, args=args, abs_e=args.abs_e, num_samples=args.sample_nums,
-                 norm_e=args.norm_e, crop_x=128, crop_y=128, img_ch=1)
+                 norm_e=args.norm_e, crop_x=128, crop_y=128, img_ch=3)
 
     tr_loder = DataLoader(tr, batch_size=args.bs, shuffle=True, num_workers=0)
 
     return tr_loder
 
-def load_model(checkpoint, device):
-    config = checkpoint['config']
-    print(config)
-    state_dict = checkpoint['state_dict']
-    logger = config.get_logger('test')
-
-    # build model architecture
-    model = config.init_obj('arch', model_arch)
-    logger.info(model)
-    if config['n_gpu'] > 1:
-        model = torch.nn.DataParallel(model)
-    model.load_state_dict(state_dict)
-
-    model = model.to(device)
-    model.eval()
-    return model
-
+E2VID_dict = {'num_bins': 5,
+              'skip_type': 'sum',
+              'recurrent_block_type': 'convlstm',
+              'num_encoders': 3,
+              'base_num_channels': 32,
+              'num_residual_blocks': 2,
+              'use_upsample_conv': True,
+              'norm': 'none'}
 def main(args):
-    loss_list = []
     # 参数初始化
     device = 'cuda:0'
-    tr = dataset(args)
     lossETp = perceptual_loss()
-    loss1 = L1Loss()
-    # lossETt = temporal_consistency_loss()
+    tr = dataset(args)
     lossfn = LossFn(as_loss=True, to_cuda=device)
-    # eitr_kwargs = {'num_bins':5, 'norm':0}
-    # netG = EITR(eitr_kwargs).cuda()
-    # netG = Unet().cuda() 
-    # netG = SSIR()
-    # network_data = torch.load("/home/thc/SSIR-main/ckpt/SSIR_e80.pth")
-    # print('=> using pretrained model {:s}'.format(args.pretrained))
-    # netG = torch.nn.DataParallel(netG).cuda()
-    # model = model.cuda()
-    # netG.load_state_dict(network_data)
-    netG = CistaLSTCNet(image_dim=[128,128], base_channels=64, depth=5, num_bins=5)
-    checkpoint = torch.load('/home/thc/V2E2V-main/pretrained/RecNet_cista-lstc.pth.tar', map_location=device)
-    netG.load_state_dict(checkpoint['state_dict'], strict=True)
-    # checkpoint = torch.load("/home/thc/EventHDR-main/EventHDR-main/model.pth") 
-    # checkpoint = torch.load("/media/thc/Elements/unsp/etnet.pth") 
-    # state_dict = checkpoint['state_dict']
-    # netG.load_state_dict(state_dict)
- 
-    # netG = load_model(checkpoint, device)
-    # netG.load_state_dict(torch.load(osp.join('model/SPADE_E2VID.pth'), map_location=device))
-    netG = netG.to(device)
+    # netG = Unet().cuda()
+    # netG.load_state_dict(torch.load(osp.join('/home/thc/unsp1/model/SPADE_E2VID.pth'), map_location=device))
+    netG = E2VIDRecurrent(E2VID_dict).cuda()
+    netG = load_model('/home/thc/unsp1/model/E2VID.pth.tar')
     netG.train()
     tr_param = netG.parameters()
     optimizerG = torch.optim.Adam(tr_param, args.lr)
@@ -525,28 +489,23 @@ def main(args):
     seq_len = args.seq_len
     loss_for_train = []
     k = 0
-    elapsed0 = 0
-    elapsed1 = 0
-    elapsed2 = 0
-    start_time0 = time.time()
     for e in range(args.epochs):
         for i, (train_events, train_image) in enumerate(tr):
-            # train_pred = 0
-            # feat0 = 0
-            # pred0 = 0
-            with torch.no_grad():
-            # #     # pred_tensors
-                pred_tensors = torch.zeros([1, sample_nums, 1, 128, 128])
-            # #     for idx in range(sample_nums):
-            # #         # pred = torch.mean(train_events[0, idx, :], dim=[0, 1]).repeat(1, 3, 1, 1)
-            # #         input_event = train_events[:, idx, 0, :3].detach()
-            # #         pred_tensors[:, idx, :] = input_event
-
-            # #     pred_tensors = pred_tensors.to(device)
-            # #     train_image = train_image.to(device)
-                pred_from_net = torch.zeros(pred_tensors.shape).to(device)
+            # torch.cuda.empty_cache()
             train_events = train_events.to(device)
-            train_image = train_image.to(device)
+
+            with torch.no_grad():
+                # pred_tensors
+                pred_tensors = torch.zeros([1, sample_nums, 3, 128, 128])
+                for idx in range(sample_nums):
+                    # pred = torch.mean(train_events[0, idx, :], dim=[0, 1]).repeat(1, 3, 1, 1)
+                    input_event = train_events[:, idx, 0, :3].detach()
+                    pred_tensors[:, idx, :] = input_event
+
+                pred_tensors = pred_tensors.to(device)
+                train_image = train_image.to(device)
+                pred_from_net = torch.zeros(pred_tensors.shape).to(device)
+
             for sample_idx in range(sample_nums):
                 # 训练的输入
                 train_pred = pred_tensors[:, sample_idx, :]
@@ -555,84 +514,44 @@ def main(args):
 
                 # 输入训练数据，得到输出和state
                 for seq_idx in range(15):
-                    if seq_idx == 0:
-                        prev_img = torch.zeros_like(train_image)  
-                        state = None       
-                    output, state = netG(train_events[:, sample_idx, seq_idx], prev_img, state)
-                    prev_img = output.clone()
-            # torch.cuda.synchronize()
-            # start_time1 = time.time()
                     # if seq_idx % 2 == 0:
                     #     with torch.no_grad():
-                    #          pred0 = netG(train_events[:, seq_idx, :])
+                    train_pred, stats = netG(train_events[:, sample_idx, seq_idx], stats)
                     # else:
-            # start_time2 = time.time()
+                    #     train_pred, stats = netG(train_events[:, sample_idx, seq_idx], stats)
+                    # train_pred, stats = netG(train_events[:, sample_idx, seq_idx], stats, train_pred)
+                # feaure_map_path = 'saved_image/feature_map/' + 'epoch_' + str(e) + '_idx_' + str(i) + '_sam_' + str(sample_idx) + '.jpg'
+                # train_pred_path = 'saved_image/train_pred/' + 'epoch_' + str(e) + '_idx_' + str(i) + '_sam_' + str(sample_idx) +  '.jpg'
+                # visualize_feature_map(feaure_map[0], feaure_map_path)
+                # visualize_feature_map(train_pred[0], train_pred_path)
+                # 记录每个sample的pred
+                pred_from_net[:, sample_idx, :] = train_pred
+            # loss_all = lossETp(train_pred, train_image)
             
-                    # pred0 = netG(train_events[:, sample_idx, seq_idx],  )
-                pred_from_net[:, sample_idx, :] = output
-            # imgs = imgs.repeat(img_ch, 1, 1)
-            # torch.cuda.synchronize()
-            # elapsed0 += time.time() - start_time2
-            
-            # feat0, pred0 = netG(train_events[:, 0, 7])
-            # feat1, pred1 = netG(train_events[:, 1, 7]) 
-            # feat2, pred2 = netG(train_events[:, 2, 7]) 
-            # feat3, pred3 = netG(train_events[:, 3, 7]) 
-            # feat4, pred4 = netG(train_events[:, 4, 7]) 
-                        # if seq_idx == 0:
-                        #     train_pred = pred0
-                        # else :
-                        #     train_pred = torch.cat((train_pred,pred0),dim = 0)
-            # torch.cuda.synchronize()
-            
-            # elapsed1 += time.time() - start_time1  
 
-            
-            # loss_all = loss1(pred0, train_image)
-            # loss_all = lossfn.improved_loss(train_pred, train_image[0, :].repeat(sample_nums, 1, 1, 1), k)
+            ssim_loss, mse_loss, lpips_loss, k, loss_all = lossfn.improved_loss(pred_from_net[0, :], train_image[0, :].repeat(sample_nums, 1, 1, 1), k)
 
             # ssim_loss, mse_loss, lpips_loss, k, loss_all = lossfn.improved_loss(pred_from_net[0, :],
-                                                                                # train_image[0, :].repeat(sample_nums, 1,
-                                                                                                        #  1, 1), k)
-            ssim_loss, mse_loss, lpips_loss, k, loss_all = lossfn.improved_loss(pred_from_net[0, :],train_image[0, :].repeat(sample_nums, 1, 1, 1), k)
-            # sum_loss = loss_all
+            #                                                                     train_image[0, :].repeat(sample_nums, 1,
+            #                                                                                              1, 1), k)
+            ssim_loss = ssim_loss.detach()
+            mse_loss = mse_loss.detach()
+            lpips_loss = lpips_loss.detach()
+            sum_loss = loss_all
 
-            # with torch.no_grad():
-                # loss_for_train.append([sum_loss.item(), ssim_loss.item(),
-                                    #    mse_loss.item(), lpips_loss.item()])
+            with torch.no_grad():
+                loss_for_train.append([sum_loss.item(), ssim_loss.item(),
+                                       mse_loss.item(), lpips_loss.item()])
 
             print(
                 f'all:{loss_all.item():.3f}'
                 f'epoch:{e}')
-            
-            
-            
-            optimizerG.zero_grad()
-            # loss_all.requires_grad_(True)  # 加入此句就行了 
 
-            loss_all.backward()
-            # loss_all.backward()
-            # loss123.backward()
-            # print('1')
-                  
-
+            loss_all.backward(retain_graph=True)
             optimizerG.step()
-            # optimizerG.zero_grad()    # 清空梯度
-            # loss_list.append(loss_all.item())
-
-
-            # netG.eval()
-            # torch.cuda.empty_cache()
-            
-            # torch.cuda.synchronize()
-        elapsed0 = time.time() - start_time0
-        print(elapsed0)
-        
+            # 删除占用空间的变量
 
         if e == 40:
-            # elapsed2 = time.time() - start_time0
-            print('time/img', elapsed0, 'time/batch', elapsed1, 'time/epoch', elapsed2 )
-
             break
         # if e >= 40 and e % 10 == 0:
         #     path = os.path.join('./saved_models', 'interval_sampling')
@@ -640,10 +559,9 @@ def main(args):
         #         os.makedirs(path)
         #     save_path = os.path.join(path, 'nums_' + str(sample_nums) + '_eps_' + str(e) + '.pth')
         #     torch.save(deepcopy(netG.state_dict()), save_path)
-    torch.save(netG.state_dict(), osp.join('/media/thc/Elements/unsp/self_paced2_1124.pth'))
+    # torch.save(netG.state_dict(), osp.join('/media/thc/Elements/unsp/self_paced1.pth'))
     print('Finish')
 
-torch.autograd.set_detect_anomaly(True)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -652,7 +570,7 @@ if __name__ == '__main__':
                         default='/media/thc/Elements/unsp/evs_2',
                         help='Path to dir')
     parser.add_argument('--bs', type=int, default=1, help='Batch size')
-    parser.add_argument('--epochs', type=int, default=200, help='Number of epochs')
+    parser.add_argument('--epochs', type=int, default=91, help='Number of epochs')
     parser.add_argument('--seq_len', type=int, default=15, help='Sequence length')
     parser.add_argument('--abs_e', type=bool, default=False, help='Use non-polarity format')
     parser.add_argument('--norm_e', type=bool, default=True, help='Normalize events')
