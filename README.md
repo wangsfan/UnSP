@@ -8,6 +8,10 @@ You will need to generate the training dataset yourself, using ESIM. To find out
 ## Testing Dataset
 One can download the testing dataset(IJRR17) from the link below:
 https://download.ifi.uzh.ch/rpg/web/data/E2VID/datasets/ECD_IJRR17/. 
+## Train
+python self_paced_test.py
+## Test
+python my_benchmark.py
 
 # Citation
 
