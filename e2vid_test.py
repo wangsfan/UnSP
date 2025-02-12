@@ -1,0 +1,488 @@
+# -*- coding: utf-8 -*-
+"""
+@File  : self_paced_test.py
+@Author: 林嚣张
+@Date  : 2023/4/6 10:24
+@Software  : pycharm
+"""
+import argparse
+import itertools
+import os
+import os.path as osp
+import re
+from copy import deepcopy
+from datetime import datetime
+from pathlib import Path
+
+import cv2
+import kornia.geometry.transform as K
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+import torch.utils.data as data
+from torch.utils.data import DataLoader
+from cedric_firenet.options.inference_options import set_inference_options
+from e2v_utils import LossFn
+from org_e2vid.model import E2VIDRecurrent
+
+
+class DataSet(data.Dataset):
+    def __init__(self, path, train, seq_len, args, abs_e=True, crop_x=256, crop_y=256, img_ch=1, num_samples=7,
+                 norm_e=False):
+        self.train = train
+        self.crop_x = crop_x
+        self.crop_y = crop_y
+        self.num_bins = 5
+        self.abs_e = abs_e
+        self.norm_e = norm_e
+        self.img_ch = img_ch
+        self.w = 240
+        self.h = 180
+        self.flip_p = 0.5
+        self.ang = 10
+
+        self.num_evs = int(self.w * self.h)
+        self.t, self.x, self.y, self.p = 2, 3, 4, 1
+        self.seq_len = seq_len
+        self.evs_len = seq_len * self.num_evs
+        self.num_samples = num_samples
+        self.args = args
+
+        if train:
+            trainpath = Path(path)
+            fname = [itm for itm in os.scandir(trainpath) if itm.is_file()]
+
+            files = [Path(itm).as_posix() for itm in fname if Path(itm).suffix == '.csv']
+            self.files = [list(g) for _, g in itertools.groupby(sorted(files), lambda x: x[0:-9])]
+            self.imgs = [Path(itm).as_posix() for itm in fname if Path(itm).suffix == '.jpg']
+
+        else:
+            self.json_path = Path(path) / "event"
+            self.img_path = Path(path) / "img"
+            self.fnames = [o.name for o in os.scandir(self.json_path) if o.is_file()]
+            self.fnames = [o for o in self.fnames if (self.img_path / (o.split('.')[0] + '.jpg')).is_file()]
+            self.fnames = [o.split('.')[0] for o in self.fnames if int(o.split('_')[-1].split('.')[0]) > 2]
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, item):
+
+        fname = self.files[item]
+        iname = [l for l in self.imgs if l.startswith(fname[0][:-9])]
+        iname.sort()
+
+        randx = np.random.randint(0, self.w - self.crop_x)
+        randy = np.random.randint(0, self.h - self.crop_y)
+        flipud = np.random.uniform(0, 1) > self.flip_p
+        fliprl = np.random.uniform(0, 1) > self.flip_p
+        angle = np.random.uniform(-self.ang, self.ang)
+        self.args_ = [randx, randy, flipud, fliprl, angle]
+        img_t = self.fix_time([int(itm[-16:-4]) for itm in iname])
+
+        # 从csv文件中读取事件数据
+        evs_stream = torch.zeros(0, 4).float()
+        for i, fn in enumerate(fname):
+            ev_ten = pd.read_csv(fn)
+            ev_ten = torch.from_numpy(ev_ten.values[:, [self.t, self.x, self.y, self.p]]).float()
+            evs_stream = torch.cat([evs_stream, ev_ten], 0)
+            if evs_stream.shape[0] > self.evs_len:
+                break
+
+        evs_stream[:, 0] = torch.from_numpy(self.fix_time(evs_stream[:, 0].numpy()))
+        gussion_stream = self.Gussion_group_sampling(evs_stream)
+
+        if self.abs_e:
+            evs_stream[:, 3] = 1
+
+        im_idx = np.searchsorted(img_t, evs_stream[-1, 0].item(), side="rigth")
+        image_ref = cv2.imread(iname[im_idx - 1], cv2.IMREAD_GRAYSCALE)
+
+        img = image_ref / 255.0
+        img = torch.from_numpy(img[None]).float()
+        imgs = self.transform_koria(img, *self.args_)
+
+        if self.img_ch == 3:
+            imgs = imgs.repeat(self.img_ch, 1, 1)
+
+        return gussion_stream, imgs
+
+    def image_check(self, imgs):
+        save_path = './images/check/image/'
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+        image_len = imgs.shape[1]
+        for i in range(image_len):
+            now = datetime.now()
+            timestr = now.strftime("%d_%H_%M_%S.png")
+            image = np.array(imgs[0, i, :].reshape(128, 128, 3))
+            plt.imsave(save_path + timestr, image)
+
+    def fix_time(self, vect):
+        ref = np.ones(len(vect) - 1)
+        y_hat = np.diff(vect) / ref
+        starts = np.where(y_hat < 0)[0]
+        vect = np.asarray(vect)
+        for i in range(len(starts)):
+            vect[starts[i] + 1:] += vect[starts[i]]
+        return vect
+
+    def atoi(self, text):
+        return int(text) if text.isdigit() else text
+
+    def natural_keys(self, text):
+        return [self.atoi(c) for c in re.split(r'(\d+)', text)]
+
+    def Gussion_single_sampling(self, evs_stream):
+        events = torch.zeros([self.num_samples, self.seq_len, self.num_bins, self.crop_x, self.crop_y]).float()
+        # 这里用self.seq_len来截断evs_stream，插入高斯采样
+        evs_streams = self.gaussian_sampling_stream(event_stream=evs_stream, num_samples=self.num_samples)
+        # events_sample: [num_samples, self.seq_len, 5, H, W]
+        for nums, stream_in_list in enumerate(evs_streams):
+            # 使evs_stream的长度能被self.seq_len整除
+            stream_in_list = stream_in_list[0:int(stream_in_list.shape[0] / self.seq_len - 1) * self.seq_len, :]
+            for i, ev_ten in enumerate(np.split(stream_in_list, self.seq_len)):
+                try:
+                    assert ev_ten.shape[1] == 4
+                    ev_ten = self.ev2grid(ev_ten, num_bins=self.num_bins, width=self.w, height=self.h)
+                    events[nums, i] = self.transform_koria(ev_ten, *self.args_)
+                    if self.norm_e:
+                        events[nums, i] = self.norm(events[nums, i])
+                except:
+                    print('eve_streams:', evs_streams)
+                    print('stream_in_list:', stream_in_list)
+                    print('ev_ten:', ev_ten)
+        return events
+
+    def Gussion_group_sampling(self, evs_stream):
+        # 初始化events
+        output_events = torch.zeros([self.num_samples, self.seq_len, self.num_bins, self.crop_x, self.crop_y]).float()
+
+        # 初始化事件体素
+        sampled_events = torch.zeros([self.seq_len, 5, 128, 128])
+
+        # 高斯选择15个事件点，通过self paced最终得到self.num_samples个事件帧
+        # 高斯采样初始化，设置均值为0.35，标准差为0.02
+        num_min = int(0.2 * self.w * self.h)
+        num_max = int(0.5 * self.w * self.h)
+        nums = np.random.choice(np.arange(num_min, num_max + 1), size=self.num_samples, replace=False) * 15
+
+        for sample_id, sample_num in enumerate(nums):
+            # Take first n events from events
+            sample = evs_stream[-nums[sample_id]:]
+            for idx, evs in enumerate(np.split(sample, 15)):
+                # Call ev2grid to aggregate events into voxels
+                voxel_grid = self.ev2grid(evs, num_bins=self.num_bins, width=self.w, height=self.h)
+
+                # transform for the events
+                event_transform = self.transform_koria(voxel_grid, *self.args_)
+
+                # Add voxel_grid to sampled_events
+                if self.norm_e:
+                    norm_events = self.norm(event_transform)
+                    sampled_events[idx, :] = norm_events
+                else:
+                    sampled_events[idx, :] = event_transform
+
+            output_events[sample_id, :] = sampled_events
+
+        return output_events
+
+    def gaussian_sampling_stream(self, event_stream, num_samples):
+        # Set range of sampled event numbers
+        num_min = int(self.down_bound * self.w * self.h * self.seq_len)
+        num_max = int(self.up_bound * self.w * self.h * self.seq_len)
+
+        # Create an array to save events_sample
+        sampled_events = []
+
+        # 定义区间
+        left = 0
+        right = int(self.w * self.h * self.seq_len * 0.35)
+
+        for sample_id in range(num_samples):
+            # Take first n events from events
+            sample = event_stream[left:right, :]
+            sampled_events.append(sample)
+
+            # Sample number of events from Gaussian distribution
+            n = np.random.randint(num_min, num_max)
+
+            # 更新区间
+            left = left + n
+            right = right + n
+
+        return sampled_events
+
+    def gaussian_sampling(self, events, num_samples):
+        """
+        Apply Gaussian sampling to the events.
+        Args:
+            events (np.ndarray): The input events with shape (num_events, 4), including t, x, y, p.
+            num_samples (int): The number of samples.
+        Returns:
+            sampled_events (list): A list of sampled event sets.
+        """
+        # Calculate number of events
+        num_events = events.shape[0]
+
+        # Set range of sampled event numbers
+        num_min = int(0.3 * self.w * self.h)
+        num_max = int(0.5 * self.w * self.h)
+
+        # Create an array to save events_sample
+        sampled_events = torch.zeros([num_samples, 5, 128, 128])
+
+        for sample_id in range(num_samples):
+            # Sample number of events from Gaussian distribution
+            n = np.random.randint(num_min, num_max)
+
+            # Take first n events from events
+            sample = events[:n, :]
+
+            # Call ev2grid to aggregate events into voxels
+            voxel_grid = self.ev2grid(sample, num_bins=self.num_bins, width=self.w, height=self.h)
+
+            # transform for the events
+            event_transform = self.transform_koria(voxel_grid, *self.args_)
+
+            # Add voxel_grid to sampled_events
+            sampled_events[sample_id, :] = event_transform
+
+        if self.norm_e:
+            sampled_events = self.norm(sampled_events)
+
+        return sampled_events
+
+    def ev2grid(self, events, num_bins, width, height):
+        """
+        Build a voxel grid with bilinear interpolation in the time domain from a set of events.
+
+        :param events: a [N x 4] NumPy array containing one event per row in the form: [timestamp, x, y, polarity]
+        :param num_bins: number of bins in the temporal axis of the voxel grid
+        :param width, height: dimensions of the voxel grid
+        :param device: device to use to perform computations
+        :return voxel_grid: PyTorch event tensor (on the device specified)
+        """
+
+        assert (events.shape[1] == 4)
+        assert (num_bins > 0)
+        assert (width > 0)
+        assert (height > 0)
+
+        with torch.no_grad():
+            voxel_grid = torch.zeros(num_bins, height, width, dtype=torch.float32).flatten()
+            # normalize the event timestamps so that they lie between 0 and num_bins
+            last_stamp = events[-1, 0]
+            first_stamp = events[0, 0]
+            deltaT = last_stamp - first_stamp
+
+            if deltaT == 0:
+                deltaT = 1.0
+
+            events[:, 0] = (num_bins - 1) * (events[:, 0] - first_stamp) / deltaT
+            ts = events[:, 0]
+            xs = events[:, 1].long()
+            ys = events[:, 2].long()
+            pols = events[:, 3].float()
+            pols[pols == 0] = -1  # polarity should be +1 / -1
+
+            tis = torch.floor(ts)
+            tis_long = tis.long()
+            dts = ts - tis
+            vals_left = pols * (1.0 - dts.float())
+            vals_right = pols * dts.float()
+
+            valid_indices = tis < num_bins
+            valid_indices &= tis >= 0
+            voxel_grid.index_add_(dim=0,
+                                  index=xs[valid_indices] + ys[valid_indices]
+                                        * width + tis_long[valid_indices] * width * height,
+                                  source=vals_left[valid_indices])
+
+            valid_indices = (tis + 1) < num_bins
+            valid_indices &= tis >= 0
+
+            voxel_grid.index_add_(dim=0,
+                                  index=xs[valid_indices] + ys[valid_indices] * width
+                                        + (tis_long[valid_indices] + 1) * width * height,
+                                  source=vals_right[valid_indices])
+
+            voxel_grid = voxel_grid.view(num_bins, height, width)
+
+        return voxel_grid
+
+    def transform(self, evs, img, randx, randy, flipud, fliprl, angle):
+        img = img.transpose([1, 2, 0])  # channels last
+        evs = evs.transpose([1, 2, 0])  # channels last
+        if fliprl:
+            evs = cv2.flip(evs, 1)
+            img = cv2.flip(img, 1)
+        if flipud:
+            evs = cv2.flip(evs, 0)
+            img = cv2.flip(img, 0)
+
+        center = (img.shape[0] // 2, img.shape[1] // 2)
+        M = cv2.getRotationMatrix2D(center=center, angle=angle, scale=1)
+        img = cv2.warpAffine(img, M, (img.shape[1], img.shape[0]))
+        evs = cv2.warpAffine(evs, M, (evs.shape[1], evs.shape[0]))
+
+        evs = evs.transpose([2, 0, 1])  # channels first
+        img = img.transpose([2, 0, 1])  # channels first
+
+        evs = evs[:, randy: randy + self.crop_size, randx: randx + self.crop_size]
+        img = img[:, randy: randy + self.crop_size, randx: randx + self.crop_size]
+
+        return evs, img
+
+    def transform_koria(self, tensor, randx, randy, flipud, fliprl, angle):
+
+        if flipud:
+            tensor = torch.flip(tensor, dims=(0, 1))
+        if fliprl:
+            tensor = torch.flip(tensor, dims=(0, 2))
+
+        # tensor = kornia.rotate(tensor, angle=angle, center=(tensor.shape[3], tensor.shape[2])
+        center = torch.ones(1, 2)
+        center[..., 0] = tensor.shape[2] / 2  # x
+        center[..., 1] = tensor.shape[1] / 2  # y
+        scale = torch.ones((1, 2))
+        angle = torch.ones(1) * angle
+
+        # M = KG.rotation(center, angle, scale)
+        M = K.get_rotation_matrix2d(center, angle, scale)
+        tensor = K.warp_affine(tensor[None], M, dsize=(self.h, self.w))[0]
+
+        tensor = tensor[:, randy: randy + self.crop_y, randx: randx + self.crop_x]
+
+        return tensor
+
+    def norm(self, events):
+        with torch.no_grad():
+            nonzero_ev = (events != 0)
+            num_nonzeros = nonzero_ev.sum()
+            if num_nonzeros > 0:
+                mean = events.sum() / num_nonzeros
+                stddev = torch.sqrt((events ** 2).sum() / num_nonzeros - mean ** 2)
+                mask = nonzero_ev.float()
+                events = mask * (events - mean) / (stddev + 1e-8)
+
+        return events
+
+
+def dataset(args):
+    trainpath = osp.join(args.root_dir)
+    tr = DataSet(trainpath, train=True, seq_len=args.seq_len, args=args, abs_e=args.abs_e, num_samples=args.sample_nums,
+                 norm_e=args.norm_e, crop_x=128, crop_y=128, img_ch=3)
+
+    tr_loder = DataLoader(tr, batch_size=args.bs, shuffle=True, num_workers=0)
+
+    return tr_loder
+
+E2VID_dict = {'num_bins': 5,
+              'skip_type': 'sum',
+              'recurrent_block_type': 'convlstm',
+              'num_encoders': 3,
+              'base_num_channels': 32,
+              'num_residual_blocks': 2,
+              'use_upsample_conv': True,
+              'norm': 'none'}
+
+def main(args):
+    # 参数初始化
+    device = 'cuda:0'
+    tr = dataset(args)
+    lossfn = LossFn(as_loss=True, to_cuda=device)
+    netG = E2VIDRecurrent(E2VID_dict).cuda()
+    netG.load_state_dict(torch.load(osp.join('./model/firenet_1000.pth.tar'), map_location=device)['state_dict'])
+    netG.train()
+    tr_param = netG.parameters()
+    optimizerG = torch.optim.Adam(tr_param, args.lr)
+
+    # training
+    sample_nums = args.sample_nums
+    seq_len = args.seq_len
+    loss_for_train = []
+    k = 0
+    for e in range(args.epochs):
+        for i, (train_events, train_image) in enumerate(tr):
+            # torch.cuda.empty_cache()
+            train_events = train_events.to(device)
+
+            with torch.no_grad():
+                # pred_tensors
+                pred_tensors = torch.zeros([1, sample_nums, 3, 128, 128])
+                for idx in range(sample_nums):
+                    # pred = torch.mean(train_events[0, idx, :], dim=[0, 1]).repeat(1, 3, 1, 1)
+                    input_event = train_events[:, idx, 0, :3].detach()
+                    pred_tensors[:, idx, :] = input_event
+
+                pred_tensors = pred_tensors.to(device)
+                train_image = train_image.to(device)
+                pred_from_net = torch.zeros(pred_tensors.shape).to(device)
+
+            for sample_idx in range(sample_nums):
+                # 训练的输入
+                train_pred = pred_tensors[:, sample_idx, :]
+                optimizerG.zero_grad()
+                stats = None
+
+                # 输入训练数据，得到输出和state
+                for seq_idx in range(seq_len):
+                    if seq_idx % 2 == 0:
+                        with torch.no_grad():
+                            train_pred, stats = netG(train_events[:, sample_idx, seq_idx], stats)
+                    else:
+                        train_pred, stats = netG(train_events[:, sample_idx, seq_idx], stats)
+                    # train_pred, stats = netG(train_events[:, sample_idx, seq_idx], stats, train_pred)
+                # 记录每个sample的pred
+                pred_from_net[:, sample_idx, :] = train_pred
+
+            ssim_loss, mse_loss, lpips_loss, k, loss_all = lossfn.improved_loss(pred_from_net[0, :],
+                                                                                train_image[0, :].repeat(sample_nums, 1,
+                                                                                                         1, 1), k)
+            ssim_loss = ssim_loss.detach()
+            mse_loss = mse_loss.detach()
+            lpips_loss = lpips_loss.detach()
+            sum_loss = loss_all
+
+            with torch.no_grad():
+                loss_for_train.append([sum_loss.item(), ssim_loss.item(),
+                                       mse_loss.item(), lpips_loss.item()])
+
+            print(
+                f'all:{sum_loss.item():.3f}, ssim:{ssim_loss.item():.3f}, '
+                f'mse:{mse_loss.item():.3f}, lpips:{lpips_loss.item():.3f}, epoch:{e}')
+
+            loss_all.backward(retain_graph=True)
+            optimizerG.step()
+            # 删除占用空间的变量
+
+        if e >= 50 and e % 10 == 0:
+            path = os.path.join('./saved_models', 'e2vid_test')
+            if os.path.exists(path) is None:
+                os.makedirs(path)
+            save_path = os.path.join(path, 'nums_' + str(sample_nums) + '_eps_' + str(e) + '.pth')
+            torch.save(deepcopy(netG.state_dict()), save_path)
+
+
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--root_dir',
+                        type=str,
+                        default='/media/thc/Elements/unsp/evs_2',
+                        help='Path to dir')
+    parser.add_argument('--bs', type=int, default=1, help='Batch size')
+    parser.add_argument('--epochs', type=int, default=130, help='Number of epochs')
+    parser.add_argument('--seq_len', type=int, default=15, help='Sequence length')
+    parser.add_argument('--sample_nums', type=int, default=10, help='Number of sampling')
+    parser.add_argument('--abs_e', type=bool, default=False, help='Use non-polarity format')
+    parser.add_argument('--norm_e', type=bool, default=True, help='Normalize events')
+    parser.add_argument('--lr', type=float, default=1e-6, help='Learning rate')
+    parser.add_argument('--num_bins', type=float, default=1e-6, help='Learning rate')
+    set_inference_options(parser)
+    args = parser.parse_args()
+    main(args)
